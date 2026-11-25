@@ -34,17 +34,22 @@ pub mod miii_protocol {
     ) -> Result<()> {
         let registry = &mut ctx.accounts.device_registry;
         let event = &mut ctx.accounts.motion_event;
-        let current_time = Clock::get()?.unix_timestamp;
-
+        
         require!(registry.is_active, CustomError::DeviceInactive);
         require!(registry.owner == ctx.accounts.user.key(), CustomError::UnauthorizedUser);
 
         // --- ПРОВЕРКА ED25519 ПОДПИСИ ---
-        let message = format!("{}-{}-{}-{}", trick_type, g_force, timestamp, sequence);
+        // Используем Vec вместо format! (чтобы не было ошибки с heap-памятью)
+        let mut message = Vec::new();
+        message.extend_from_slice(&trick_type.to_le_bytes());
+        message.extend_from_slice(&g_force.to_le_bytes());
+        message.extend_from_slice(&timestamp.to_le_bytes());
+        message.extend_from_slice(&sequence.to_le_bytes());
+
         verify_ed25519_signature(
             &ctx.accounts.instructions_sysvar,
             &registry.device_pubkey,
-            message.as_bytes(),
+            &message,
         )?;
 
         require!(sequence == registry.sequence, CustomError::InvalidSequence);
@@ -79,12 +84,14 @@ pub mod miii_protocol {
 
 // --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ED25519 ---
 fn verify_ed25519_signature(
-    instructions_sysvar: &AccountInfo,
+    instructions_sysvar: &UncheckedAccount,
     expected_pubkey: &Pubkey,
     expected_message: &[u8],
 ) -> Result<()> {
-    let instructions = sysvar_instructions::load_instruction_at_checked(0, instructions_sysvar)
-        .map_err(|_| error!(CustomError::MissingEd25519Instruction))?;
+    let instructions = sysvar_instructions::load_instruction_at_checked(
+        0, 
+        &instructions_sysvar.to_account_info()
+    ).map_err(|_| error!(CustomError::MissingEd25519Instruction))?;
 
     require!(instructions.program_id == ed25519_program::id(), CustomError::InvalidEd25519Instruction);
 
@@ -109,10 +116,17 @@ fn verify_ed25519_signature(
 // --- АККАУНТЫ И СТРУКТУРЫ ---
 
 #[derive(Accounts)]
+#[instruction(device_pubkey: Pubkey)] // Добавлено для работы seeds
 pub struct RegisterDevice<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
-    #[account(init, payer = owner, space = 8 + 32 + 32 + 1 + 8 + 8 + 1, seeds = [b"device", device_pubkey.as_ref()], bump)]
+    #[account(
+        init, 
+        payer = owner, 
+        space = 8 + 32 + 32 + 1 + 8 + 8 + 1, 
+        seeds = [b"device", device_pubkey.as_ref()], 
+        bump
+    )]
     pub device_registry: Account<'info, DeviceRegistry>,
     pub system_program: Program<'info, System>,
 }
@@ -121,11 +135,25 @@ pub struct RegisterDevice<'info> {
 pub struct RecordMotion<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
+    
+    /// CHECK: This is the Solana instructions sysvar, verified by address constraint.
     #[account(address = sysvar_instructions::ID)]
     pub instructions_sysvar: UncheckedAccount<'info>,
-    #[account(mut, seeds = [b"device", device_registry.device_pubkey.as_ref()], bump = device_registry.bump)]
+    
+    #[account(
+        mut, 
+        seeds = [b"device", device_registry.device_pubkey.as_ref()], 
+        bump = device_registry.bump
+    )]
     pub device_registry: Account<'info, DeviceRegistry>,
-    #[account(init, payer = user, space = 8 + 32 + 32 + 1 + 4 + 8 + 8 + 1, seeds = [b"motion", device_registry.device_pubkey.as_ref(), &device_registry.sequence.to_le_bytes()], bump)]
+    
+    #[account(
+        init, 
+        payer = user, 
+        space = 8 + 32 + 32 + 1 + 4 + 8 + 8 + 1, 
+        seeds = [b"motion", device_registry.device_pubkey.as_ref(), &device_registry.sequence.to_le_bytes()], 
+        bump
+    )]
     pub motion_event: Account<'info, MotionEvent>,
     pub system_program: Program<'info, System>,
 }
